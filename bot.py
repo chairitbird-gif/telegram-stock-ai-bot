@@ -12,7 +12,7 @@ import feedparser
 import requests
 from deep_translator import GoogleTranslator
 from dotenv import load_dotenv
-from telegram import LinkPreviewOptions, Update
+from telegram import BotCommand, LinkPreviewOptions, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -360,8 +360,21 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------- main
 
 
+async def post_init(app: Application) -> None:
+    await app.bot.set_my_commands(
+        [
+            BotCommand("start", "เริ่มรับข่าว + ดูวิธีใช้"),
+            BotCommand("news", "ดูข่าวล่าสุด เช่น /news NVDA"),
+            BotCommand("watchlist", "ดูรายชื่อหุ้นที่ติดตาม"),
+            BotCommand("add", "เพิ่มหุ้น เช่น /add TSLA"),
+            BotCommand("remove", "ลบหุ้น เช่น /remove TSLA"),
+            BotCommand("stop", "หยุดรับข่าว"),
+        ]
+    )
+
+
 def main() -> None:
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("watchlist", cmd_watchlist))
