@@ -21,6 +21,9 @@ load_dotenv()
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+AI_MODEL = os.environ.get("AI_MODEL", "openai/gpt-4o-mini").strip()
+HAS_AI = bool(ANTHROPIC_API_KEY or OPENAI_API_KEY or OPENROUTER_API_KEY)
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))  # วินาที
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -171,6 +174,19 @@ def llm_analysis(ticker: str, title: str, summary: str) -> dict | None:
             )
             r.raise_for_status()
             text = r.json()["choices"][0]["message"]["content"]
+        elif OPENROUTER_API_KEY:
+            r = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+                json={
+                    "model": AI_MODEL,
+                    "max_tokens": 600,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=60,
+            )
+            r.raise_for_status()
+            text = r.json()["choices"][0]["message"]["content"]
         else:
             return None
         match = re.search(r"\{.*\}", text, re.DOTALL)
@@ -236,7 +252,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if chat_id not in data["chats"]:
         data["chats"].append(chat_id)
         save_data(data)
-    ai = "✅ เปิดใช้งาน" if (ANTHROPIC_API_KEY or OPENAI_API_KEY) else "❌ ยังไม่มี API key (ใช้ keyword วิเคราะห์แทน)"
+    ai = "✅ เปิดใช้งาน" if HAS_AI else "❌ ยังไม่มี API key (ใช้ keyword วิเคราะห์แทน)"
     await update.message.reply_text(
         "👋 สวัสดีครับ! ผมคือ bot ข่าวหุ้นสหรัฐฯ แปลไทย\n\n"
         f"📈 Watchlist: {', '.join(data['watchlist'])}\n"
