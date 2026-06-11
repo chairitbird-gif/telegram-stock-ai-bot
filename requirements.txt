@@ -1,0 +1,8 @@
+python-telegram-bot==21.0.1
+httpx
+feedparser
+python-dotenv
+openai
+finnhub-python
+beautifulsoup4
+lxml
