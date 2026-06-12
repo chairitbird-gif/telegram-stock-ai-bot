@@ -35,6 +35,28 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_FILE = BASE_DIR / "data.json"
 DEFAULT_WATCHLIST = ["RKLB", "EOSE", "ASTS", "RDW", "NVDA"]
 
+KNOWN_NAMES = {
+    "NVDA": "Nvidia",
+    "RKLB": "Rocket Lab",
+    "EOSE": "Eos Energy",
+    "ASTS": "AST SpaceMobile",
+    "RDW": "Redwire",
+    "TSLA": "Tesla",
+    "PLTR": "Palantir",
+    "SOFI": "SoFi",
+}
+
+# บทความความเห็น/listicle/เปรียบเทียบ — ไม่ใช่ข่าวจริงของบริษัท ตัดทิ้งก่อนเลย
+NOISE_RE = re.compile(
+    r"(\b\d+\s+(reasons?|stocks?|things)\b"
+    r"|better buy|best stocks?|stocks? to buy( now)?"
+    r"|should you buy|if you'?d invested|too late to buy"
+    r"|where will .{3,50} be in|prediction|millionaire|magnificent"
+    r"|bull case|bear case|history says|\bvs\.?\s"
+    r"|here'?s (why|how) .{3,60} (rose|fell|jumped|sank|soared|plunged|dropped|rallied))",
+    re.I,
+)
+
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
 )
@@ -58,6 +80,7 @@ def load_data() -> dict:
     data.setdefault("chats", env_chats)
     data.setdefault("watchlist", env_watch or list(DEFAULT_WATCHLIST))
     data.setdefault("seen", {})
+    data.setdefault("recent_titles", [])
     return data
 
 
@@ -88,6 +111,61 @@ def fetch_news(ticker: str, limit: int = 5) -> list[dict]:
             }
         )
     return items
+
+
+_name_cache: dict[str, str] = {}
+
+
+def get_company_name(ticker: str) -> str:
+    if ticker in KNOWN_NAMES:
+        return KNOWN_NAMES[ticker]
+    if ticker in _name_cache:
+        return _name_cache[ticker]
+    name = ticker
+    try:
+        r = requests.get(
+            "https://query2.finance.yahoo.com/v1/finance/search",
+            params={"q": ticker, "quotesCount": 5, "newsCount": 0},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        for q in r.json().get("quotes", []):
+            if q.get("symbol") == ticker and (q.get("shortname") or q.get("longname")):
+                name = q.get("shortname") or q["longname"]
+                name = re.sub(
+                    r"[,.]?\s*(inc|corp|corporation|ltd|plc|co|company)\.?$",
+                    "", name, flags=re.I,
+                ).strip()
+                break
+    except Exception as exc:
+        log.warning("name lookup %s failed: %s", ticker, exc)
+    _name_cache[ticker] = name
+    return name
+
+
+_STOPWORDS = {
+    "the", "and", "for", "with", "from", "this", "that", "are", "its", "has",
+    "have", "will", "stock", "stocks", "shares", "says", "after", "amid",
+}
+
+
+def title_tokens(title: str) -> set[str]:
+    t = re.split(r"\s+-\s+", title.lower())[0]  # ตัดชื่อสำนักข่าวท้ายหัวข้อ
+    return {w for w in re.findall(r"[a-z0-9']+", t) if len(w) > 2 and w not in _STOPWORDS}
+
+
+def is_duplicate_title(title: str, recent: list[str]) -> bool:
+    toks = title_tokens(title)
+    if not toks:
+        return False
+    for prev in recent:
+        ptoks = set(prev.split())
+        if not ptoks:
+            continue
+        union = len(toks | ptoks)
+        if union and len(toks & ptoks) / union >= 0.6:
+            return True
+    return False
 
 
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
@@ -156,15 +234,19 @@ def heuristic_analysis(title: str, summary: str) -> dict:
     return {"bullish": bullish, "neutral": neutral, "bearish": bearish, "impact": impact}
 
 
-LLM_PROMPT = """คุณเป็นนักวิเคราะห์หุ้นสหรัฐฯ วิเคราะห์ข่าวต่อไปนี้ของหุ้น {ticker}
+LLM_PROMPT = """คุณเป็นนักวิเคราะห์หุ้นสหรัฐฯ ที่มีประสบการณ์ 20 ปี ประเมินข่าวต่อไปนี้สำหรับหุ้น {ticker} ({company})
 
 หัวข้อ: {title}
 เนื้อหา: {summary}
 
 ตอบเป็น JSON เท่านั้น (ไม่มีข้อความอื่น) รูปแบบ:
-{{"summary_th": "สรุปข่าวภาษาไทย 1-2 ประโยค", "pros": ["ข้อดี 1", "ข้อดี 2"], "cons": ["ความเสี่ยง 1", "ความเสี่ยง 2"], "bullish": 50, "neutral": 30, "bearish": 20, "impact": "สูง/กลาง/ต่ำ"}}
+{{"relevant": true, "news_type": "earnings", "material": "สูง", "summary_th": "สรุปข่าวภาษาไทย 1-2 ประโยค", "pros": ["ข้อดี 1"], "cons": ["ความเสี่ยง 1"], "bullish": 50, "neutral": 30, "bearish": 20, "impact": "สูง"}}
 
-bullish+neutral+bearish ต้องรวมเป็น 100 (ความน่าจะเป็นของทิศทางราคาใน 1-7 วัน)"""
+เกณฑ์ (เข้มงวดแบบนักลงทุนจริง):
+- relevant: true เฉพาะเมื่อข่าวนี้เป็นข่าวของ {company} โดยตรง — false ถ้าเป็นข่าวบริษัทอื่นที่แค่เอ่ยถึง {company}, ข่าวรวมหลายหุ้น (roundup), หรือข่าวภาพรวมอุตสาหกรรม
+- news_type: earnings|guidance|contract|analyst|ma|product|insider|index|offering|legal|macro|opinion|roundup|recap|other
+- material: "สูง" = กระทบรายได้/กำไร/แนวโน้มชัดเจน (earnings, guidance, สัญญาใหญ่, M&A, upgrade/downgrade, เพิ่มทุน) | "กลาง" = ข่าวจริงแต่ผลจำกัด | "ต่ำ" = บทความความเห็น, listicle, สรุปราคารายวัน, แค่เอ่ยชื่อ
+- bullish+neutral+bearish รวม 100 (ทิศทางราคา 1-7 วัน)"""
 
 
 def llm_text(prompt: str, max_tokens: int = 600) -> str | None:
@@ -220,9 +302,11 @@ def llm_text(prompt: str, max_tokens: int = 600) -> str | None:
         return None
 
 
-def llm_analysis(ticker: str, title: str, summary: str) -> dict | None:
+def llm_analysis(ticker: str, company: str, title: str, summary: str) -> dict | None:
     text = llm_text(
-        LLM_PROMPT.format(ticker=ticker, title=title, summary=summary or title)
+        LLM_PROMPT.format(
+            ticker=ticker, company=company, title=title, summary=summary or title
+        )
     )
     if not text:
         return None
@@ -237,9 +321,39 @@ def llm_analysis(ticker: str, title: str, summary: str) -> dict | None:
 # ---------------------------------------------------------------- formatting
 
 
-def build_message(ticker: str, item: dict) -> str:
+def evaluate_item(ticker: str, company: str, item: dict) -> tuple[bool, dict | None, str]:
+    """กรองข่าวแบบนักลงทุน: คืน (ควรส่งไหม, ผลวิเคราะห์, เหตุผล)"""
+    title, summary = item["title"], item.get("summary", "")
+    if NOISE_RE.search(title):
+        return False, None, "opinion/listicle"
+    mentions = [ticker.lower(), company.lower()]
+    in_title = any(m in title.lower() for m in mentions)
+    in_summary = any(m in summary.lower() for m in mentions)
+    if not in_title and not in_summary:
+        return False, None, "no direct mention"
+    analysis = llm_analysis(ticker, company, title, summary) if HAS_AI else None
+    if analysis:
+        if analysis.get("relevant") is False:
+            return False, analysis, "AI: not directly about company"
+        if str(analysis.get("news_type", "")).lower() in ("opinion", "roundup", "recap"):
+            return False, analysis, "AI: opinion/roundup/recap"
+        if analysis.get("material") == "ต่ำ":
+            return False, analysis, "AI: low materiality"
+        if not in_title and analysis.get("material") != "สูง":
+            return False, analysis, "mentioned in body only, not high impact"
+    elif not in_title:
+        return False, None, "mentioned in body only"
+    return True, analysis, "ok"
+
+
+def build_message(
+    ticker: str, item: dict, analysis: dict | None = None, company: str | None = None
+) -> str:
     title_th = translate_th(item["title"])
-    analysis = llm_analysis(ticker, item["title"], item["summary"])
+    if analysis is None:
+        analysis = llm_analysis(
+            ticker, company or ticker, item["title"], item["summary"]
+        )
     ai_mode = analysis is not None
     if analysis is None:
         analysis = heuristic_analysis(item["title"], item["summary"])
@@ -476,8 +590,9 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not items:
         await update.message.reply_text(f"ไม่พบข่าวของ {ticker} ในตอนนี้ครับ")
         return
+    company = await asyncio.to_thread(get_company_name, ticker)
     for item in items:
-        msg = await asyncio.to_thread(build_message, ticker, item)
+        msg = await asyncio.to_thread(build_message, ticker, item, None, company)
         await update.message.reply_text(
             msg, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW
         )
@@ -518,8 +633,25 @@ async def check_news_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         changed = True
         if first_run:
             continue  # บันทึก baseline ก่อน ไม่ spam ข่าวเก่าตอนเริ่ม
-        for item in new_items[:3]:
-            msg = await asyncio.to_thread(build_message, ticker, item)
+        company = await asyncio.to_thread(get_company_name, ticker)
+        sent = 0
+        for item in new_items[:5]:
+            if sent >= 2:  # จำกัด 2 ข่าว/หุ้น/รอบ กันสแปม
+                break
+            if is_duplicate_title(item["title"], data["recent_titles"]):
+                log.info("skip dup [%s]: %s", ticker, item["title"][:70])
+                continue
+            ok, analysis, reason = await asyncio.to_thread(
+                evaluate_item, ticker, company, item
+            )
+            if not ok:
+                log.info("skip [%s] (%s): %s", ticker, reason, item["title"][:70])
+                continue
+            msg = await asyncio.to_thread(build_message, ticker, item, analysis, company)
+            data["recent_titles"] = (
+                data["recent_titles"] + [" ".join(title_tokens(item["title"]))]
+            )[-300:]
+            sent += 1
             for chat_id in data["chats"]:
                 try:
                     await context.bot.send_message(
@@ -584,7 +716,16 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------- main
 
 
+BOT_VERSION = "1.2-smart-filter"
+
+
 async def post_init(app: Application) -> None:
+    try:
+        await app.bot.set_my_short_description(
+            f"ข่าวหุ้นสหรัฐฯ แปลไทย + AI วิเคราะห์ | v{BOT_VERSION}"
+        )
+    except Exception as exc:
+        log.warning("set description failed: %s", exc)
     await app.bot.set_my_commands(
         [
             BotCommand("start", "เริ่มรับข่าว + ดูวิธีใช้"),
