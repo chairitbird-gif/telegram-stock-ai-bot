@@ -46,16 +46,28 @@ KNOWN_NAMES = {
     "SOFI": "SoFi",
 }
 
-# บทความความเห็น/listicle/เปรียบเทียบ — ไม่ใช่ข่าวจริงของบริษัท ตัดทิ้งก่อนเลย
+# บทความความเห็น/listicle/เปรียบเทียบ/recap — ไม่ใช่ข่าวจริงของบริษัท ตัดทิ้งก่อนเลย
 NOISE_RE = re.compile(
     r"(\b\d+\s+(reasons?|stocks?|things)\b"
-    r"|better buy|best stocks?|stocks? to buy( now)?"
+    r"|better buy|best stocks?|stocks? to buy( now)?|top stock"
     r"|should you buy|if you'?d invested|too late to buy"
     r"|where will .{3,50} be in|prediction|millionaire|magnificent"
     r"|bull case|bear case|history says|\bvs\.?\s"
-    r"|here'?s (why|how) .{3,60} (rose|fell|jumped|sank|soared|plunged|dropped|rallied))",
+    r"|here'?s (why|how)|why .{3,60}\b(today|this week|right now)"
+    r"|could (soar|jump|surge|reach|hit|double|triple|be worth)"
+    r"|what (to know|you need to know)|need to know"
+    r"|is it (a buy|time to buy)|time to buy|worth buying"
+    r"|billionaire|warren buffett|cathie wood"
+    r"|what'?s going on with|smart(er)? (buy|investors)"
+    r"|(rose|fell|jumped|sank|soared|plunged|dropped|rallied)\s+(today|this week))",
     re.I,
 )
+
+# ประเภทข่าวที่เป็น catalyst จริงในสายตานักลงทุน
+HARD_CATALYSTS = {
+    "earnings", "guidance", "contract", "analyst", "ma",
+    "insider", "index", "offering", "legal",
+}
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -322,27 +334,28 @@ def llm_analysis(ticker: str, company: str, title: str, summary: str) -> dict | 
 
 
 def evaluate_item(ticker: str, company: str, item: dict) -> tuple[bool, dict | None, str]:
-    """กรองข่าวแบบนักลงทุน: คืน (ควรส่งไหม, ผลวิเคราะห์, เหตุผล)"""
+    """กรองข่าวแบบเข้มสุด: คืน (ควรส่งไหม, ผลวิเคราะห์, เหตุผล)"""
     title, summary = item["title"], item.get("summary", "")
     if NOISE_RE.search(title):
-        return False, None, "opinion/listicle"
+        return False, None, "opinion/listicle/recap"
     mentions = [ticker.lower(), company.lower()]
-    in_title = any(m in title.lower() for m in mentions)
-    in_summary = any(m in summary.lower() for m in mentions)
-    if not in_title and not in_summary:
-        return False, None, "no direct mention"
+    if not any(m in title.lower() for m in mentions):
+        return False, None, "company not in headline"
     analysis = llm_analysis(ticker, company, title, summary) if HAS_AI else None
     if analysis:
-        if analysis.get("relevant") is False:
+        rel = analysis.get("relevant")
+        if not (rel is True or str(rel).lower() == "true"):
             return False, analysis, "AI: not directly about company"
-        if str(analysis.get("news_type", "")).lower() in ("opinion", "roundup", "recap"):
+        ntype = str(analysis.get("news_type", "")).lower()
+        if ntype in ("opinion", "roundup", "recap"):
             return False, analysis, "AI: opinion/roundup/recap"
-        if analysis.get("material") == "ต่ำ":
-            return False, analysis, "AI: low materiality"
-        if not in_title and analysis.get("material") != "สูง":
-            return False, analysis, "mentioned in body only, not high impact"
-    elif not in_title:
-        return False, None, "mentioned in body only"
+        mat = analysis.get("material", "")
+        if mat == "สูง":
+            pass  # catalyst แรง ส่งได้เสมอ
+        elif mat == "กลาง" and ntype in HARD_CATALYSTS:
+            pass  # ผลกลางแต่เป็นข่าวประเภท catalyst จริง
+        else:
+            return False, analysis, f"AI: not material enough ({mat}/{ntype})"
     return True, analysis, "ok"
 
 
@@ -634,10 +647,7 @@ async def check_news_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         if first_run:
             continue  # บันทึก baseline ก่อน ไม่ spam ข่าวเก่าตอนเริ่ม
         company = await asyncio.to_thread(get_company_name, ticker)
-        sent = 0
-        for item in new_items[:5]:
-            if sent >= 2:  # จำกัด 2 ข่าว/หุ้น/รอบ กันสแปม
-                break
+        for item in new_items:
             if is_duplicate_title(item["title"], data["recent_titles"]):
                 log.info("skip dup [%s]: %s", ticker, item["title"][:70])
                 continue
@@ -651,7 +661,6 @@ async def check_news_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             data["recent_titles"] = (
                 data["recent_titles"] + [" ".join(title_tokens(item["title"]))]
             )[-300:]
-            sent += 1
             for chat_id in data["chats"]:
                 try:
                     await context.bot.send_message(
@@ -716,7 +725,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------- main
 
 
-BOT_VERSION = "1.2-smart-filter"
+BOT_VERSION = "1.3-max-filter"
 
 
 async def post_init(app: Application) -> None:
