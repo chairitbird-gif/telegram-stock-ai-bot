@@ -506,6 +506,104 @@ def build_gold_summary() -> str:
     )
 
 
+# ---------------------------------------------------------------- daily movers
+
+
+def get_quote(ticker: str) -> dict | None:
+    try:
+        r = requests.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
+            params={"range": "2d", "interval": "1d"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        meta = r.json()["chart"]["result"][0]["meta"]
+        price = meta.get("regularMarketPrice")
+        prev = meta.get("previousClose") or meta.get("chartPreviousClose")
+        if price and prev:
+            return {"price": price, "prev": prev, "pct": (price - prev) / prev * 100}
+    except Exception as exc:
+        log.warning("quote %s failed: %s", ticker, exc)
+    return None
+
+
+def collect_ticker_news(ticker: str, company: str, limit: int = 6) -> list[str]:
+    """รวมพาดหัวข่าววันนี้จากหลายแหล่ง (Yahoo + Google) แล้วตัดข่าวซ้ำ"""
+    raw: list[dict] = []
+    try:
+        raw += fetch_news(ticker, 6)
+    except Exception as exc:
+        log.warning("movers yahoo %s failed: %s", ticker, exc)
+    try:
+        raw += fetch_feed(f'"{company}" {ticker} stock when:1d', 8)
+    except Exception as exc:
+        log.warning("movers google %s failed: %s", ticker, exc)
+    titles: list[str] = []
+    seen_tokens: list[str] = []
+    mentions = (ticker.lower(), company.lower())
+    for it in raw:
+        title = it["title"]
+        if NOISE_RE.search(title):
+            continue
+        if not any(m in title.lower() for m in mentions):
+            continue
+        if is_duplicate_title(title, seen_tokens):
+            continue
+        seen_tokens.append(" ".join(title_tokens(title)))
+        titles.append(re.split(r"\s+-\s+[^-]+$", title)[0])  # ตัดชื่อสำนักข่าวท้าย
+        if len(titles) >= limit:
+            break
+    return titles
+
+
+MOVERS_PROMPT = """คุณเป็นนักวิเคราะห์หุ้นสหรัฐฯ มืออาชีพ ด้านล่างคือการเคลื่อนไหวราคาหุ้นในวอทช์ลิสต์วันนี้ พร้อมพาดหัวข่าวของแต่ละตัว
+
+{blocks}
+
+งาน: อธิบายเป็นภาษาไทยว่าแต่ละหุ้น "ขึ้นหรือลงเพราะอะไรวันนี้" โดยอิงจากข่าวจริงเท่านั้น
+กฎสำคัญ:
+- ถ้าหุ้นหลายตัวขยับไปทางเดียวกันด้วยเหตุผลเดียวกัน (เช่น แรงขายทั้งกลุ่มอวกาศ, ข่าว Fed, ภาพรวมตลาดทั้งกระดาน) ให้ "รวมเป็นกลุ่มเดียว" — เขียนเหตุผลครั้งเดียว ระบุรายชื่อหุ้นในกลุ่ม อย่าเขียนซ้ำทีละตัว
+- หุ้นที่มีข่าวเฉพาะตัว (earnings, สัญญา, ปรับเรต) แยกเขียนพร้อมเหตุผลชัดเจน
+- หุ้นที่ไม่มีข่าวอธิบายการเคลื่อนไหว ให้บอกตรงๆ ว่า "เคลื่อนตามตลาด ไม่มีข่าวเฉพาะตัว" (ห้ามเดาเหตุผลลอยๆ)
+- กระชับ ตรงประเด็น แบบนักลงทุนคุยกัน
+
+รูปแบบ (ใช้ +/-% จริง):
+📅 สรุปหุ้นวันนี้ — ทำไมขึ้น/ลง
+
+🔻 กลุ่ม/หุ้นที่ลง:
+• [ชื่อหุ้น +/-%] เหตุผล...
+
+🔺 กลุ่ม/หุ้นที่ขึ้น:
+• [ชื่อหุ้น +/-%] เหตุผล...
+
+(ถ้าหลายตัวเหตุผลเดียวกัน รวมบรรทัดเดียว เช่น "RKLB -3%, ASTS -5%: แรงขายทั้งกลุ่มอวกาศหลัง...")"""
+
+
+def build_movers() -> str:
+    data = load_data()
+    blocks = []
+    fallback_lines = []
+    for tk in data["watchlist"]:
+        q = get_quote(tk)
+        company = get_company_name(tk)
+        news = collect_ticker_news(tk, company)
+        pct = f"{q['pct']:+.2f}%" if q else "ราคาไม่พบ"
+        heads = "\n".join("- " + t for t in news) or "- (ไม่มีข่าวเฉพาะตัววันนี้)"
+        blocks.append(f"[{tk}] {company}: {pct}\nข่าววันนี้:\n{heads}")
+        fallback_lines.append(
+            f"• {tk} {pct}" + (f" — {news[0]}" if news else " — ไม่มีข่าวเฉพาะตัว")
+        )
+    if not blocks:
+        return "ยังไม่มีหุ้นใน watchlist ครับ ลอง /add ก่อน"
+    if HAS_AI:
+        text = llm_text(
+            MOVERS_PROMPT.format(blocks="\n\n".join(blocks)), max_tokens=1400
+        )
+        if text:
+            return text.strip()
+    return "📅 สรุปหุ้นวันนี้ (เปลี่ยนแปลงราคา)\n\n" + "\n".join(fallback_lines)
+
+
 HIGH_IMPACT_WORDS = [
     "war", "invasion", "invades", "airstrike", "airstrikes", "missile", "nuclear",
     "rate cut", "rate hike", "rate decision", "fed cuts", "fed hikes", "fed chair",
@@ -569,9 +667,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"⏱ เช็คข่าวใหม่ทุก {CHECK_INTERVAL // 60} นาที\n\n"
         "📬 ของที่จะได้รับอัตโนมัติ:\n"
         "• ข่าวหุ้นใน watchlist (เช็คทุก 5 นาที)\n"
+        "• สรุปหุ้นรายวัน ทำไมขึ้น/ลง ทุกเช้า 05:00 น.\n"
         "• สรุปภาพรวมตลาด+ทองคำ วันละ 2 รอบ (07:00 และ 20:00 น.)\n"
         "• Macro Alert ข่าวใหญ่ (สงคราม/Fed/เงินเฟ้อ) เด้งทันที\n\n"
         "คำสั่ง:\n"
+        "/movers — สรุปหุ้นวันนี้ ทำไมขึ้น/ลง\n"
         "/market — สรุปภาพรวมตลาดตอนนี้\n"
         "/gold — สรุปข่าวทองคำ\n"
         "/news NVDA — ข่าวล่าสุดรายหุ้น\n"
@@ -653,6 +753,14 @@ async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_gold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("🔎 กำลังสรุปข่าวทองคำ...")
     text = await asyncio.to_thread(build_gold_summary)
+    await update.message.reply_text(text[:3900], link_preview_options=NO_PREVIEW)
+
+
+async def cmd_movers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "🔎 กำลังรวบรวมราคา+ข่าวหลายแหล่ง เพื่อสรุปว่าหุ้นแต่ละตัวขยับเพราะอะไรวันนี้ (~30-60 วินาที)..."
+    )
+    text = await asyncio.to_thread(build_movers)
     await update.message.reply_text(text[:3900], link_preview_options=NO_PREVIEW)
 
 
@@ -756,6 +864,20 @@ async def digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             log.warning("digest send to %s failed: %s", chat_id, exc)
 
 
+async def movers_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = load_data()
+    if not data["chats"]:
+        return
+    text = await asyncio.to_thread(build_movers)
+    for chat_id in data["chats"]:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id, text=text[:3900], link_preview_options=NO_PREVIEW
+            )
+        except Exception as exc:
+            log.warning("movers send to %s failed: %s", chat_id, exc)
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.error("Error: %s", context.error)
 
@@ -763,7 +885,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------- main
 
 
-BOT_VERSION = "1.4-why-it-matters"
+BOT_VERSION = "1.5-daily-movers"
 
 
 async def post_init(app: Application) -> None:
@@ -776,6 +898,7 @@ async def post_init(app: Application) -> None:
     await app.bot.set_my_commands(
         [
             BotCommand("start", "เริ่มรับข่าว + ดูวิธีใช้"),
+            BotCommand("movers", "สรุปหุ้นวันนี้ ทำไมขึ้น/ลง (จัดกลุ่ม)"),
             BotCommand("news", "ดูข่าวล่าสุด เช่น /news NVDA"),
             BotCommand("market", "สรุปภาพรวมตลาดสหรัฐฯ + ทองคำ"),
             BotCommand("gold", "สรุปข่าวทองคำ"),
@@ -797,12 +920,15 @@ def main() -> None:
     app.add_handler(CommandHandler("news", cmd_news))
     app.add_handler(CommandHandler("market", cmd_market))
     app.add_handler(CommandHandler("gold", cmd_gold))
+    app.add_handler(CommandHandler("movers", cmd_movers))
     app.add_error_handler(on_error)
     app.job_queue.run_repeating(check_news_job, interval=CHECK_INTERVAL, first=15)
     if MARKET_NEWS or GOLD_NEWS:
         # 00:00 UTC = 07:00 น. ไทย (หลังตลาดสหรัฐฯ ปิด), 13:00 UTC = 20:00 น. ไทย (ก่อนเปิด)
         app.job_queue.run_daily(digest_job, time=dtime(hour=0, minute=0, tzinfo=dt_tz.utc))
         app.job_queue.run_daily(digest_job, time=dtime(hour=13, minute=0, tzinfo=dt_tz.utc))
+    # สรุปหุ้นรายวัน "ทำไมขึ้น/ลง" — 22:00 UTC = 05:00 น. ไทย (หลังตลาดสหรัฐฯ ปิดสนิททั้งฤดูร้อน/หนาว)
+    app.job_queue.run_daily(movers_job, time=dtime(hour=22, minute=0, tzinfo=dt_tz.utc))
     log.info("Bot running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
