@@ -683,6 +683,16 @@ def fmt_fair_value(fv: dict | None) -> str:
     )
 
 
+def fmt_fair_compact(fv: dict | None) -> str:
+    """ย่อมูลค่าเหมาะสมเหลือสั้นๆ สำหรับ /movers เช่น 'เป้า $105 (+3%) ซื้อ'"""
+    if not fv or not fv.get("mean"):
+        return ""
+    rec = REC_TH.get(str(fv.get("rec")), "")
+    up = fv.get("upside")
+    tail = f" ({up:+.0f}%)" if up is not None else ""
+    return f"เป้า ${fv['mean']:.0f}{tail} · {rec}".strip(" ·")
+
+
 def _fmt_date_th(iso: str | None) -> str:
     """'2026-08-06' -> '06/08/2026' (+ระบุถ้าใกล้ภายใน 7 วัน)"""
     if not iso:
@@ -745,26 +755,27 @@ def collect_ticker_news(ticker: str, company: str, limit: int = 6) -> list[str]:
     return titles
 
 
-MOVERS_PROMPT = """คุณเป็นนักวิเคราะห์หุ้นสหรัฐฯ มืออาชีพ ด้านล่างคือข้อมูลหุ้นทุกตัวในวอทช์ลิสต์วันนี้ (ราคา, มูลค่าเหมาะสมจากนักวิเคราะห์, พาดหัวข่าว) และข่าวทองคำ
+MOVERS_PROMPT = """คุณเป็นนักวิเคราะห์หุ้นสหรัฐฯ มืออาชีพ ด้านล่างคือข้อมูลหุ้นทุกตัวในวอทช์ลิสต์วันนี้ (ราคา, มูลค่าเหมาะสมแบบย่อ, พาดหัวข่าว) และทองคำ
 
 {blocks}
 
-งาน: เขียนสรุปภาษาไทยให้นักลงทุน ครอบคลุม "ทุกตัว" ที่ให้มา
-กฎสำคัญ:
-- ⚠️ ตัวเลขทุกตัว (ราคา, %, มูลค่าเหมาะสม, คำแนะนำ) ให้คัดลอกตามที่ให้มาเป๊ะๆ ห้ามแก้/ห้ามคิดเอง ทิศทางเหตุผลต้องสอดคล้องกับ +/-%
-- ต้องแสดงครบทุกหุ้น — หุ้นที่ไม่มีข่าวให้เขียนว่า "ยังไม่มีข่าววันนี้ (เคลื่อนตามตลาด)" แต่ยังต้องแสดงราคาและมูลค่าเหมาะสม
-- ถ้าหุ้นหลายตัวลง/ขึ้นด้วยเหตุผลเดียวกัน (เช่น แรงขายทั้งกลุ่มอวกาศ, ข่าว Fed) ให้รวมเหตุผลเป็นกลุ่มเดียว แต่ยังคงแสดงราคา+มูลค่าเหมาะสมรายตัว
-- ถ้ามีข่าว "ปรับเรตติ้ง" ต้องระบุให้ชัดว่าปรับจากอะไรเป็นอะไร และราคาเป้าหมายใหม่ถ้ามีในข่าว (เช่น "Jefferies ลดจาก Buy เหลือ Hold เป้า $18")
-- กระชับ ตรงประเด็น แบบนักลงทุนคุยกัน
+งาน: เขียนสรุปสั้นๆ ให้นักลงทุนเหลือบดูเร็ว ครอบคลุมทุกตัว — "1 บรรทัดต่อหุ้น"
+กฎ:
+- ⚠️ คัดลอกตัวเลข (ราคา, %, เป้า) ตามที่ให้มาเป๊ะๆ ห้ามแก้ ทิศทางเหตุผลต้องตรงกับ +/-%
+- แต่ละหุ้น 1 บรรทัด: <SYM> $ราคา (+/-%) · เป้าย่อ · เหตุผลสั้นๆว่าขึ้น/ลงเพราะอะไร (ถ้าไม่มีข่าวให้พิมพ์ "ไม่มีข่าวเฉพาะตัว")
+- ถ้าหลายตัวขึ้น/ลงเพราะเหตุเดียวกัน ใส่หัวกลุ่มสั้นๆ แล้วลิสต์หุ้นใต้กลุ่ม (เหตุผลเขียนครั้งเดียวที่หัวกลุ่ม)
+- ถ้ามีข่าวปรับเรตติ้ง บอกสั้นๆ เช่น "Jefferies ลด Buy→Hold"
+- ห้ามยาว ห้ามใส่ P/E/แนวรับแนวต้าน (อยู่ใน /stock แล้ว)
 
-รูปแบบ (แต่ละหุ้น 3 บรรทัด คัดลอกตัวเลขที่ให้มาเป๊ะๆ):
-📅 สรุปหุ้นวันนี้ + มูลค่าเหมาะสม
+รูปแบบ:
+📅 สรุปหุ้นวันนี้
 
-• <SYM> $ราคา (+/-%) — เหตุผลที่ขึ้น/ลง (หรือ "ยังไม่มีข่าววันนี้")
-  📈 <บรรทัดมูลค่าเหมาะสม>
-  📐 <บรรทัดข้อมูลพื้นฐาน/เทคนิค (P/E, แนวรับ/แนวต้าน, ประกาศผล)>
+🔻 ที่ลง:
+• <SYM> $ราคา (-%) · เป้าย่อ · เหตุผล
+🔺 ที่ขึ้น:
+• <SYM> $ราคา (+%) · เป้าย่อ · เหตุผล
 
-🥇 ทองคำ: $ราคา (+/-%) — ทิศทาง + ปัจจัยขับเคลื่อนสั้นๆ"""
+🥇 ทองคำ $ราคา (+/-%) — ทิศทางสั้นๆ"""
 
 
 def build_movers() -> str:
@@ -777,45 +788,58 @@ def build_movers() -> str:
         q = get_quote(tk)
         fv = get_fair_value(tk)
         company = get_company_name(tk)
-        news = collect_ticker_news(tk, company)
+        news = collect_ticker_news(tk, company, limit=3)
         price = fmt_price(q)
-        fair = fmt_fair_value(fv)
-        tech = fmt_technical(q, fv)
-        heads = "\n".join("- " + t for t in news) or "- (ไม่มีข่าวเฉพาะตัววันนี้)"
-        blocks.append(
-            f"[{tk}] {company}: {price}\n{fair}\nข้อมูลพื้นฐาน/เทคนิค: {tech}\n"
-            f"ข่าววันนี้:\n{heads}"
-        )
+        compact = fmt_fair_compact(fv)
+        heads = "; ".join(news) if news else "(ไม่มีข่าวเฉพาะตัว)"
+        blocks.append(f"[{tk}] {company}: {price} | {compact}\nข่าว: {heads}")
         fallback_lines.append(
-            f"• {tk} {price}" + (f" — {news[0]}" if news else " — ยังไม่มีข่าววันนี้")
-            + f"\n  📈 {fair}\n  📐 {tech}"
+            f"• {tk} {price}" + (f" · {compact}" if compact else "")
+            + (f" · {news[0]}" if news else " · ไม่มีข่าวเฉพาะตัว")
         )
-    # ทองคำ
+    # ทองคำ (บรรทัดเดียว)
     gq = get_quote("GC=F")
-    gold_news = fetch_feed(GOLD_QUERY, 4)
-    gold_heads = "\n".join("- " + i["title"] for i in gold_news) or "- (ไม่มีข่าว)"
     gold_price = fmt_price(gq) if gq else "ราคาไม่พบ"
-    blocks.append(f"[ทองคำ GOLD] ราคา: {gold_price}\nข่าววันนี้:\n{gold_heads}")
+    blocks.append(f"[ทองคำ GOLD]: {gold_price}")
 
     now_th = datetime.now(dt_tz.utc).astimezone(THAI_TZ).strftime("%d/%m %H:%M")
     footer = (
-        f"\n\n📡 ข้อมูล ณ {now_th} น. (ไทย)\n"
-        "ราคา & เป้านักวิเคราะห์: Yahoo Finance | ข่าว: Yahoo + Google News (24 ชม.ล่าสุด)\n"
-        "ℹ️ มูลค่าเหมาะสม = ค่าเฉลี่ยเป้าหมายนักวิเคราะห์ ไม่ใช่คำแนะนำลงทุน"
+        f"\n\n📡 ณ {now_th} น. | เป้า = ค่าเฉลี่ยนักวิเคราะห์ (Yahoo) ไม่ใช่คำแนะนำลงทุน\n"
+        "💡 ดูรายตัวละเอียด: /stock <SYM>"
     )
     if HAS_AI:
         text = llm_text(
-            MOVERS_PROMPT.format(blocks="\n\n".join(blocks)), max_tokens=1800
+            MOVERS_PROMPT.format(blocks="\n\n".join(blocks)), max_tokens=1100
         )
         if text:
             return text.strip() + footer
-    gold_line = f"\n\n🥇 ทองคำ: {gold_price}"
+    gold_line = f"\n🥇 ทองคำ: {gold_price}"
     return (
-        "📅 สรุปหุ้นวันนี้ + มูลค่าเหมาะสม\n\n"
-        + "\n".join(fallback_lines)
-        + gold_line
-        + footer
+        "📅 สรุปหุ้นวันนี้\n\n" + "\n".join(fallback_lines) + gold_line + footer
     )
+
+
+def build_stock(ticker: str) -> str:
+    company = get_company_name(ticker)
+    q = get_quote(ticker)
+    if not q:
+        return f"❌ หาข้อมูล {ticker} ไม่เจอ — ตรวจสัญลักษณ์อีกครั้งครับ"
+    fv = get_fair_value(ticker)
+    news = collect_ticker_news(ticker, company, limit=4)
+    lines = [
+        f"📊 <b>{html.escape(ticker)}</b> — {html.escape(company)}",
+        f"💵 {fmt_price(q)}",
+    ]
+    if fv and fv.get("wk_hi") and fv.get("wk_lo"):
+        lines.append(f"   52 สัปดาห์: ${fv['wk_lo']:.2f} – ${fv['wk_hi']:.2f}")
+    if fv and fv.get("mean"):
+        lines += ["", "🎯 " + fmt_fair_value(fv)]
+    lines += ["", "📐 " + fmt_technical(q, fv)]
+    if news:
+        lines += ["", "📰 <b>ข่าวล่าสุด:</b>"]
+        lines += ["• " + html.escape(translate_th(t)) for t in news]
+    lines.append("\nℹ️ ข้อมูลเชิงข้อมูล ไม่ใช่คำแนะนำลงทุน")
+    return "\n".join(lines)
 
 
 def build_earnings() -> str:
@@ -943,11 +967,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• ภาพรวมตลาด (สหรัฐฯ+ทองคำ+SET) วันละ 2 รอบ (07:00 และ 20:00 น.)\n"
         "• Macro Alert ข่าวใหญ่ (สงคราม/Fed/เงินเฟ้อ) เด้งทันที\n\n"
         "คำสั่ง:\n"
-        "/movers — สรุปหุ้นวันนี้ + มูลค่าเหมาะสม + P/E + แนวรับแนวต้าน\n"
+        "/movers — เหลือบดูพอร์ตวันนี้ (1 บรรทัด/ตัว)\n"
+        "/stock NVDA — เจาะลึกรายตัว (ราคา เป้า P/E แนวรับแนวต้าน ข่าว)\n"
         "/market — ภาพรวมตลาด สหรัฐฯ+ทองคำ+SET+คริปโต/น้ำมัน\n"
         "/earnings — ปฏิทินวันประกาศผลประกอบการ\n"
         "/alert NVDA 200 — ตั้งเตือนเมื่อราคาถึง (ดู: /alert, ล้าง: /alert clear)\n"
-        "/news NVDA — ข่าวล่าสุดรายหุ้น\n"
         "/watchlist /add /remove — จัดการหุ้น\n"
         "/stop — หยุดรับข่าว"
     )
@@ -1001,20 +1025,14 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(f"🗑 ลบ {ticker} แล้ว")
 
 
-async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     data = load_data()
     ticker = (context.args[0].upper().strip() if context.args else data["watchlist"][0])
-    await update.message.reply_text(f"🔎 กำลังดึงข่าว {ticker} ...")
-    items = await asyncio.to_thread(fetch_news, ticker, 3)
-    if not items:
-        await update.message.reply_text(f"ไม่พบข่าวของ {ticker} ในตอนนี้ครับ")
-        return
-    company = await asyncio.to_thread(get_company_name, ticker)
-    for item in items:
-        msg = await asyncio.to_thread(build_message, ticker, item, None, company)
-        await update.message.reply_text(
-            msg, parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW
-        )
+    await update.message.reply_text(f"🔎 กำลังดึงข้อมูล {ticker} (ราคา เป้า ข่าว)...")
+    text = await asyncio.to_thread(build_stock, ticker)
+    await update.message.reply_text(
+        text[:3900], parse_mode=ParseMode.HTML, link_preview_options=NO_PREVIEW
+    )
 
 
 async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1212,7 +1230,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------- main
 
 
-BOT_VERSION = "1.9-pe-alerts-earnings"
+BOT_VERSION = "2.0-slim-movers-stock"
 
 
 async def post_init(app: Application) -> None:
@@ -1225,11 +1243,11 @@ async def post_init(app: Application) -> None:
     await app.bot.set_my_commands(
         [
             BotCommand("start", "เริ่มรับข่าว + ดูวิธีใช้"),
-            BotCommand("movers", "สรุปหุ้นวันนี้ + มูลค่าเหมาะสม + P/E"),
+            BotCommand("movers", "เหลือบดูพอร์ตวันนี้ (1 บรรทัด/ตัว)"),
+            BotCommand("stock", "เจาะลึกรายตัว เช่น /stock NVDA"),
             BotCommand("market", "ภาพรวมตลาด สหรัฐฯ+ทองคำ+SET+คริปโต"),
             BotCommand("earnings", "ปฏิทินวันประกาศผลประกอบการ"),
             BotCommand("alert", "ตั้งเตือนราคา เช่น /alert NVDA 200"),
-            BotCommand("news", "ดูข่าวล่าสุด เช่น /news NVDA"),
             BotCommand("watchlist", "ดูรายชื่อหุ้นที่ติดตาม"),
             BotCommand("add", "เพิ่มหุ้น เช่น /add TSLA"),
             BotCommand("remove", "ลบหุ้น เช่น /remove TSLA"),
@@ -1245,7 +1263,7 @@ def main() -> None:
     app.add_handler(CommandHandler("watchlist", cmd_watchlist))
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("remove", cmd_remove))
-    app.add_handler(CommandHandler("news", cmd_news))
+    app.add_handler(CommandHandler("stock", cmd_stock))
     app.add_handler(CommandHandler("market", cmd_market))
     app.add_handler(CommandHandler("movers", cmd_movers))
     app.add_handler(CommandHandler("alert", cmd_alert))
