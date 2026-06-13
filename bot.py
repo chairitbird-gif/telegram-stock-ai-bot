@@ -548,6 +548,90 @@ def fmt_price(q: dict | None) -> str:
     return f"{sym}{q['price']:.2f} ({q['pct']:+.2f}%)"
 
 
+_yahoo_session = None
+_yahoo_crumb = None
+
+REC_TH = {
+    "strong_buy": "ซื้อเด่นชัด", "buy": "ซื้อ", "hold": "ถือ",
+    "underperform": "ต่ำกว่าตลาด", "sell": "ขาย", "none": "ไม่มีคำแนะนำ",
+}
+
+
+def _yahoo_auth() -> tuple:
+    global _yahoo_session, _yahoo_crumb
+    s = requests.Session()
+    s.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    try:
+        s.get("https://fc.yahoo.com", timeout=10)
+    except Exception:
+        pass
+    _yahoo_crumb = s.get(
+        "https://query1.finance.yahoo.com/v1/test/getcrumb", timeout=10
+    ).text.strip()
+    _yahoo_session = s
+    return s, _yahoo_crumb
+
+
+def get_fair_value(ticker: str) -> dict | None:
+    """ราคาเป้าหมายนักวิเคราะห์ (มูลค่าเหมาะสม) จาก Yahoo — low/mean/high + คำแนะนำ"""
+    global _yahoo_session, _yahoo_crumb
+    for _ in range(2):
+        try:
+            if not _yahoo_session or not _yahoo_crumb:
+                _yahoo_auth()
+            r = _yahoo_session.get(
+                f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}",
+                params={"modules": "financialData", "crumb": _yahoo_crumb},
+                timeout=10,
+            )
+            if r.status_code in (401, 403):
+                _yahoo_session = _yahoo_crumb = None
+                continue
+            fd = r.json()["quoteSummary"]["result"][0]["financialData"]
+            g = lambda k: (fd.get(k, {}) or {}).get("raw") if isinstance(fd.get(k), dict) else fd.get(k)
+            mean = g("targetMeanPrice")
+            if not mean:
+                return None
+            cur = g("currentPrice")
+            upside = ((mean - cur) / cur * 100) if cur else None
+            return {
+                "current": cur, "low": g("targetLowPrice"), "mean": mean,
+                "high": g("targetHighPrice"), "n": g("numberOfAnalystOpinions"),
+                "rec": (g("recommendationKey") or "none"), "upside": upside,
+            }
+        except Exception as exc:
+            _yahoo_session = _yahoo_crumb = None
+            log.warning("fair value %s failed: %s", ticker, exc)
+    return None
+
+
+def fmt_fair_value(fv: dict | None) -> str:
+    if not fv or not fv.get("mean"):
+        return "ราคาเป้าหมาย: ไม่มีข้อมูลนักวิเคราะห์"
+    n = fv.get("n") or "?"
+    rng = ""
+    if fv.get("low") and fv.get("high"):
+        rng = f"${fv['low']:.2f}–${fv['high']:.2f} "
+    rec = REC_TH.get(str(fv.get("rec")), str(fv.get("rec")))
+    up = fv.get("upside")
+    if up is None:
+        verdict = ""
+    elif up >= 25:
+        verdict = f"ราคาต่ำกว่าเป้าหมายมาก (upside +{up:.0f}%)"
+    elif up >= 5:
+        verdict = f"ราคาต่ำกว่าเป้าหมายเฉลี่ย (upside +{up:.0f}%)"
+    elif up >= -5:
+        verdict = f"ราคาใกล้เคียงมูลค่าเหมาะสม ({up:+.0f}%)"
+    elif up >= -25:
+        verdict = f"ราคาสูงกว่าเป้าหมายเฉลี่ย ({up:+.0f}%)"
+    else:
+        verdict = f"ราคาสูงกว่าเป้าหมายมาก ({up:+.0f}%)"
+    return (
+        f"มูลค่าเหมาะสม (นักวิเคราะห์ {n} ราย): {rng}เฉลี่ย ${fv['mean']:.2f} | "
+        f"คำแนะนำ: {rec} | {verdict}"
+    )
+
+
 def collect_ticker_news(ticker: str, company: str, limit: int = 6) -> list[str]:
     """รวมพาดหัวข่าววันนี้จากหลายแหล่ง (Yahoo + Google) แล้วตัดข่าวซ้ำ"""
     raw: list[dict] = []
@@ -577,58 +661,73 @@ def collect_ticker_news(ticker: str, company: str, limit: int = 6) -> list[str]:
     return titles
 
 
-MOVERS_PROMPT = """คุณเป็นนักวิเคราะห์หุ้นสหรัฐฯ มืออาชีพ ด้านล่างคือการเคลื่อนไหวราคาหุ้นในวอทช์ลิสต์วันนี้ พร้อมพาดหัวข่าวของแต่ละตัว
+MOVERS_PROMPT = """คุณเป็นนักวิเคราะห์หุ้นสหรัฐฯ มืออาชีพ ด้านล่างคือข้อมูลหุ้นทุกตัวในวอทช์ลิสต์วันนี้ (ราคา, มูลค่าเหมาะสมจากนักวิเคราะห์, พาดหัวข่าว) และข่าวทองคำ
 
 {blocks}
 
-งาน: อธิบายเป็นภาษาไทยว่าแต่ละหุ้น "ขึ้นหรือลงเพราะอะไรวันนี้" โดยอิงจากข่าวจริงเท่านั้น
+งาน: เขียนสรุปภาษาไทยให้นักลงทุน ครอบคลุม "ทุกตัว" ที่ให้มา
 กฎสำคัญ:
-- ⚠️ ใช้ราคาและ % ตามที่ให้มาเป๊ะๆ ห้ามแก้ตัวเลขเอง และทิศทางเหตุผลต้องสอดคล้องกับ +/-% (ถ้าหุ้นลง เหตุผลต้องเป็นด้านลบ)
-- ถ้าหุ้นหลายตัวขยับไปทางเดียวกันด้วยเหตุผลเดียวกัน (เช่น แรงขายทั้งกลุ่มอวกาศ, ข่าว Fed, ภาพรวมตลาดทั้งกระดาน) ให้ "รวมเป็นกลุ่มเดียว" — เขียนเหตุผลครั้งเดียว ระบุรายชื่อหุ้นในกลุ่ม อย่าเขียนซ้ำทีละตัว
-- หุ้นที่มีข่าวเฉพาะตัว (earnings, สัญญา, ปรับเรต) แยกเขียนพร้อมเหตุผลชัดเจน
-- หุ้นที่ไม่มีข่าวอธิบายการเคลื่อนไหว ให้บอกตรงๆ ว่า "เคลื่อนตามตลาด ไม่มีข่าวเฉพาะตัว" (ห้ามเดาเหตุผลลอยๆ)
+- ⚠️ ตัวเลขทุกตัว (ราคา, %, มูลค่าเหมาะสม, คำแนะนำ) ให้คัดลอกตามที่ให้มาเป๊ะๆ ห้ามแก้/ห้ามคิดเอง ทิศทางเหตุผลต้องสอดคล้องกับ +/-%
+- ต้องแสดงครบทุกหุ้น — หุ้นที่ไม่มีข่าวให้เขียนว่า "ยังไม่มีข่าววันนี้ (เคลื่อนตามตลาด)" แต่ยังต้องแสดงราคาและมูลค่าเหมาะสม
+- ถ้าหุ้นหลายตัวลง/ขึ้นด้วยเหตุผลเดียวกัน (เช่น แรงขายทั้งกลุ่มอวกาศ, ข่าว Fed) ให้รวมเหตุผลเป็นกลุ่มเดียว แต่ยังคงแสดงราคา+มูลค่าเหมาะสมรายตัว
+- ถ้ามีข่าว "ปรับเรตติ้ง" ต้องระบุให้ชัดว่าปรับจากอะไรเป็นอะไร และราคาเป้าหมายใหม่ถ้ามีในข่าว (เช่น "Jefferies ลดจาก Buy เหลือ Hold เป้า $18")
 - กระชับ ตรงประเด็น แบบนักลงทุนคุยกัน
 
-รูปแบบ (ใส่ราคาและ % ตามที่ให้มา):
-📅 สรุปหุ้นวันนี้ — ทำไมขึ้น/ลง
+รูปแบบ:
+📅 สรุปหุ้นวันนี้ + มูลค่าเหมาะสม
 
-🔻 กลุ่ม/หุ้นที่ลง:
-• [ชื่อหุ้น $ราคา (+/-%)] เหตุผล...
+(แต่ละหุ้น 2 บรรทัด)
+• <SYM> $ราคา (+/-%) — เหตุผลที่ขึ้น/ลง (หรือ "ยังไม่มีข่าววันนี้")
+  📈 <บรรทัดมูลค่าเหมาะสมตามที่ให้มา>
 
-🔺 กลุ่ม/หุ้นที่ขึ้น:
-• [ชื่อหุ้น $ราคา (+/-%)] เหตุผล...
-
-(ถ้าหลายตัวเหตุผลเดียวกัน รวมบรรทัดเดียว เช่น "RKLB $24.5 (-3%), ASTS $82.4 (-15%): แรงขายทั้งกลุ่มอวกาศหลัง...")"""
+🥇 ทองคำ: $ราคา (+/-%) — ทิศทาง + ปัจจัยขับเคลื่อนสั้นๆ"""
 
 
 def build_movers() -> str:
     data = load_data()
+    if not data["watchlist"]:
+        return "ยังไม่มีหุ้นใน watchlist ครับ ลอง /add ก่อน"
     blocks = []
     fallback_lines = []
     for tk in data["watchlist"]:
         q = get_quote(tk)
+        fv = get_fair_value(tk)
         company = get_company_name(tk)
         news = collect_ticker_news(tk, company)
         price = fmt_price(q)
+        fair = fmt_fair_value(fv)
         heads = "\n".join("- " + t for t in news) or "- (ไม่มีข่าวเฉพาะตัววันนี้)"
-        blocks.append(f"[{tk}] {company}: {price}\nข่าววันนี้:\n{heads}")
+        blocks.append(f"[{tk}] {company}: {price}\n{fair}\nข่าววันนี้:\n{heads}")
         fallback_lines.append(
-            f"• {tk} {price}" + (f" — {news[0]}" if news else " — ไม่มีข่าวเฉพาะตัว")
+            f"• {tk} {price}" + (f" — {news[0]}" if news else " — ยังไม่มีข่าววันนี้")
+            + f"\n  📈 {fair}"
         )
-    if not blocks:
-        return "ยังไม่มีหุ้นใน watchlist ครับ ลอง /add ก่อน"
+    # ทองคำ
+    gq = get_quote("GC=F")
+    gold_news = fetch_feed(GOLD_QUERY, 4)
+    gold_heads = "\n".join("- " + i["title"] for i in gold_news) or "- (ไม่มีข่าว)"
+    gold_price = fmt_price(gq) if gq else "ราคาไม่พบ"
+    blocks.append(f"[ทองคำ GOLD] ราคา: {gold_price}\nข่าววันนี้:\n{gold_heads}")
+
     now_th = datetime.now(dt_tz.utc).astimezone(THAI_TZ).strftime("%d/%m %H:%M")
     footer = (
         f"\n\n📡 ข้อมูล ณ {now_th} น. (ไทย)\n"
-        "ราคา: Yahoo Finance (ราคาปิดล่าสุด) | ข่าว: Yahoo Finance + Google News (24 ชม.ล่าสุด)"
+        "ราคา & เป้านักวิเคราะห์: Yahoo Finance | ข่าว: Yahoo + Google News (24 ชม.ล่าสุด)\n"
+        "ℹ️ มูลค่าเหมาะสม = ค่าเฉลี่ยเป้าหมายนักวิเคราะห์ ไม่ใช่คำแนะนำลงทุน"
     )
     if HAS_AI:
         text = llm_text(
-            MOVERS_PROMPT.format(blocks="\n\n".join(blocks)), max_tokens=1400
+            MOVERS_PROMPT.format(blocks="\n\n".join(blocks)), max_tokens=1800
         )
         if text:
             return text.strip() + footer
-    return "📅 สรุปหุ้นวันนี้ (เปลี่ยนแปลงราคา)\n\n" + "\n".join(fallback_lines) + footer
+    gold_line = f"\n\n🥇 ทองคำ: {gold_price}"
+    return (
+        "📅 สรุปหุ้นวันนี้ + มูลค่าเหมาะสม\n\n"
+        + "\n".join(fallback_lines)
+        + gold_line
+        + footer
+    )
 
 
 HIGH_IMPACT_WORDS = [
@@ -912,7 +1011,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------------------------------------------------------------- main
 
 
-BOT_VERSION = "1.6-accurate-price"
+BOT_VERSION = "1.7-fair-value"
 
 
 async def post_init(app: Application) -> None:
